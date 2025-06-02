@@ -1,181 +1,200 @@
-import re
 import os
+import time
+import re
 import nltk
-import joblib
 import requests
 import numpy as np
-from bs4 import BeautifulSoup
-import urllib.request as urllib
+import torch
 import matplotlib.pyplot as plt
+from bs4 import BeautifulSoup
+from flask import Flask, render_template, request
+from wordcloud import WordCloud, STOPWORDS
 from nltk.corpus import stopwords
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
 from nltk.stem import WordNetLemmatizer
-from wordcloud import WordCloud,STOPWORDS
-from flask import Flask,render_template,request
-import time
-
 from selenium import webdriver
-from selenium.webdriver import Chrome
+from selenium.webdriver.chrome.service import Service as ChromeService
+from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service as ChromeService
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from torch.nn.functional import softmax
 from webdriver_manager.chrome import ChromeDriverManager
 
-options = webdriver.ChromeOptions()
-
-
+# Download necessary NLTK data
 nltk.download('vader_lexicon')
 nltk.download('stopwords')
 nltk.download('wordnet')
-#vader_lexicon_path = 'nltk_data\\sentiment\\vader_lexicon\\vader_lexicon.txt'
-#stopwords_path = 'nltk_data\\sentiment\\corpora\\stopwords\\english'
-#wordnet_path = '/path/to/local/wordnet'
 
-# Load the resources using local file paths
-#nltk.data.load(vader_lexicon_path)
-#nltk.data.load(stopwords_path,format='text')
-# nltk.data.load(wordnet_path)
-
-
-
+# Initialize Flask
 app = Flask(__name__)
 app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 0
 
+# Initialize NLP tools
 wnl = WordNetLemmatizer()
 sia = SentimentIntensityAnalyzer()
-stop_words = stopwords.words('english')
+stop_words = set(stopwords.words('english'))
 
-def returnytcomments(url):
-    data=[]
+# Load mBERT tokenizer and model
+mbert_tokenizer = AutoTokenizer.from_pretrained("nlptown/bert-base-multilingual-uncased-sentiment")
+mbert_model = AutoModelForSequenceClassification.from_pretrained("nlptown/bert-base-multilingual-uncased-sentiment")
 
-    option = webdriver.ChromeOptions()
-    #with Chrome(executable_path=r'./chromedriver.exe') as driver:
-    with webdriver.Chrome(service=ChromeService(ChromeDriverManager().install()), options=options) as driver:
-        wait = WebDriverWait(driver,15)
-        driver.get(url)
+# Setup Chrome options for Selenium WebDriver
+options = Options()
+options.add_argument("--headless")  # Run without opening a browser window
+options.add_argument("--disable-gpu")
+options.add_argument("--no-sandbox")
+options.add_argument("--disable-dev-shm-usage")
 
-        for item in range(5): 
-            wait.until(EC.visibility_of_element_located((By.TAG_NAME, "body"))).send_keys(Keys.END)
-            time.sleep(2)
+# YouTube API Key (Replace with your actual API key)
+YOUTUBE_API_KEY = ""
 
-        for comment in wait.until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, "#content"))):
-            data.append(comment.text)
+def extract_video_id(url):
+    """Extracts the YouTube video ID from various possible URL formats."""
+    match = re.search(r"(?:v=|\/)([0-9A-Za-z_-]{11}).*", url)
+    return match.group(1) if match else None
 
-    return data
+def fetch_comments_api(video_id):
+    """Fetches YouTube comments using the YouTube Data API."""
+    comments = []
+    try:
+        url = f"https://www.googleapis.com/youtube/v3/commentThreads?key={YOUTUBE_API_KEY}&textFormat=plainText&part=snippet&videoId={video_id}&maxResults=100"
+        response = requests.get(url)
+        data = response.json()
 
-def clean(org_comments):
-    y = []
-    for x in org_comments:
-        x = x.split()
-        x = [i.lower().strip() for i in x]
-        x = [i for i in x if i not in stop_words]
-        x = [i for i in x if len(i)>2]
-        x = [wnl.lemmatize(i) for i in x]
-        y.append(' '.join(x))
-    return y
+        if 'items' in data:
+            comments = [item['snippet']['topLevelComment']['snippet']['textDisplay'] for item in data['items']]
+        
+        return comments
+    except Exception as e:
+        print("API Error:", str(e))
+        return []
 
-def create_wordcloud(clean_reviews):
-    # building our wordcloud and saving it
-    for_wc = ' '.join(clean_reviews)
-    wcstops = set(STOPWORDS)
-    wc = WordCloud(width=1400,height=800,stopwords=wcstops,background_color='white').generate(for_wc)
-    plt.figure(figsize=(20,10), facecolor='k', edgecolor='k')
-    plt.imshow(wc, interpolation='bicubic') 
+def fetch_comments_selenium(url):
+    """Scrapes YouTube comments using Selenium (Fallback)."""
+    comments = []
+    try:
+        with webdriver.Chrome(service=ChromeService(ChromeDriverManager().install()), options=options) as driver:
+            wait = WebDriverWait(driver, 15)
+            driver.get(url)
+
+            # Scroll to load comments
+            for _ in range(5):  # Scroll multiple times to load more comments
+                wait.until(EC.visibility_of_element_located((By.TAG_NAME, "body"))).send_keys(Keys.END)
+                time.sleep(2)
+
+            # Extract comments
+            elements = wait.until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, "#content")))
+            comments = [el.text for el in elements if el.text.strip()]
+
+        print(f"Retrieved {len(comments)} comments via Selenium.")
+        return comments
+
+    except Exception as e:
+        print("Selenium Error:", str(e))
+        return []
+
+def clean_comments(comments):
+    """Cleans and preprocesses comments."""
+    cleaned_comments = []
+    for comment in comments:
+        comment = comment.lower()
+        comment = re.sub(r"http\S+|www\S+|https\S+", '', comment, flags=re.MULTILINE)
+        comment = re.sub(r'[^a-zA-Z\s]', '', comment)  # Remove punctuation and special characters
+        words = [wnl.lemmatize(word) for word in comment.split() if word not in stop_words and len(word) > 2]
+        cleaned_comments.append(' '.join(words))
+
+    return cleaned_comments
+
+def create_wordcloud(comments):
+    """Generates and saves a word cloud from the comments."""
+    if not comments:
+        print("No comments available for word cloud.")
+        return
+
+    text = ' '.join(comments).strip()
+
+    if not text:
+        print("Word cloud cannot be generated. No meaningful words found.")
+        return
+
+    wc = WordCloud(width=1400, height=800, stopwords=set(STOPWORDS), background_color='white').generate(text)
+    plt.figure(figsize=(10, 5))
+    plt.imshow(wc, interpolation='bilinear')
     plt.axis('off')
-    plt.tight_layout()
-    CleanCache(directory='static/images')
-    plt.savefig('static/images/woc.png')
+    plt.savefig('static/images/wc.png')
     plt.close()
-    
-def returnsentiment(x):
-    score =  sia.polarity_scores(x)['compound']
-    
-    if score>0:
-        sent = 'Positive'
-    elif score==0:
-        sent = 'Negative'
-    else:
-        sent = 'Neutral'
-    return score,sent
 
+def analyze_sentiment(comment):
+    """Performs sentiment analysis using mBERT and VADER."""
+    
+    # **Step 1: Use VADER for English**
+    vader_score = sia.polarity_scores(comment)['compound']
+    if vader_score >= 0.05:
+        vader_sentiment = 'Positive'
+    elif vader_score <= -0.05:
+        vader_sentiment = 'Negative'
+    else:
+        vader_sentiment = 'Neutral'
+
+    # **Step 2: Use mBERT for Multilingual Sentiment Analysis**
+    tokens = mbert_tokenizer(comment, return_tensors="pt", padding=True, truncation=True, max_length=512)
+    with torch.no_grad():
+        output = mbert_model(**tokens)
+    
+    probs = softmax(output.logits, dim=-1)
+    label = torch.argmax(probs).item()
+
+    # Convert label (0-4) to sentiment
+    mbert_sentiment = ['Very Negative', 'Negative', 'Neutral', 'Positive', 'Very Positive'][label]
+
+    # **Step 3: Combine Both Results**
+    if vader_sentiment == 'Neutral' and mbert_sentiment in ['Very Positive', 'Very Negative']:
+        return mbert_sentiment
+    elif mbert_sentiment == 'Neutral':
+        return vader_sentiment
+    else:
+        return mbert_sentiment if probs[label].item() > 0.6 else vader_sentiment
 
 @app.route('/')
 def home():
     return render_template('home.html')
 
-@app.route('/results',methods=['GET'])
-def result():    
+@app.route('/results', methods=['GET'])
+def result():
     url = request.args.get('url')
-    
-    org_comments = returnytcomments(url)
-    temp = []
+    video_id = extract_video_id(url)
 
-    for i in org_comments:
-         if 5<len(i)<=500:
-            temp.append(i)
-    
-    org_comments = temp
+    if not video_id:
+        return "Invalid YouTube URL. Please provide a valid video link."
 
-    clean_comments = clean(org_comments)
+    # Try API first, fallback to Selenium
+    comments = fetch_comments_api(video_id)
+    if not comments:
+        print("API failed or limit exceeded. Switching to Selenium...")
+        comments = fetch_comments_selenium(url)
 
-    create_wordcloud(clean_comments)
-    
-    np,nn,nne = 0,0,0
+    if not comments:
+        return "No comments found for this video. Please try another video."
 
-    predictions = []
-    scores = []
+    clean_comments_list = clean_comments(comments)
+    create_wordcloud(clean_comments_list)
 
-    for i in clean_comments:
-        score,sent = returnsentiment(i)
-        scores.append(score)
-        if sent == 'Positive':
-            predictions.append('POSITIVE')
-            np+=1
-        elif sent == 'Negative':
-            predictions.append('NEGATIVE')
-            nn+=1
-        else:
-            predictions.append('NEUTRAL')
-            nne+=1
+    sentiments = [analyze_sentiment(comment) for comment in clean_comments_list]
+    np, nn, nne = sentiments.count('Positive') + sentiments.count('Very Positive'), sentiments.count('Negative') + sentiments.count('Very Negative'), sentiments.count('Neutral')
 
-    dic = []
+    results = [
+        {'comment': org, 'clean_comment': clean, 'sentiment': sent}
+        for org, clean, sent in zip(comments, clean_comments_list, sentiments)
+    ]
 
-    for i,cc in enumerate(clean_comments):
-        x={}
-        x['sent'] = predictions[i]
-        x['clean_comment'] = cc
-        x['org_comment'] = org_comments[i]
-        x['score'] = scores
-        dic.append(x)
+    return render_template('result.html', n=len(clean_comments_list), np=np, nn=nn, nne=nne, dic=results)
 
-    return render_template('result.html',n=len(clean_comments),nn=nn,np=np,nne=nne,dic=dic)
-    
-    
 @app.route('/wc')
 def wc():
     return render_template('wc.html')
-
-
-class CleanCache:
-	'''
-	this class is responsible to clear any residual csv and image files
-	present due to the past searches made.
-	'''
-	def __init__(self, directory=None):
-		self.clean_path = directory
-		# only proceed if directory is not empty
-		if os.listdir(self.clean_path) != list():
-			# iterate over the files and remove each file
-			files = os.listdir(self.clean_path)
-			for fileName in files:
-				print(fileName)
-				os.remove(os.path.join(self.clean_path,fileName))
-		print("cleaned!")
-
 
 if __name__ == '__main__':
     app.run(debug=True)
